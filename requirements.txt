@@ -1,0 +1,13 @@
+# ViLNM requirements.
+#
+# torch/torchvision are listed without a CUDA pin because the right build depends
+# on your driver -- see https://pytorch.org/get-started/locally/ for the CUDA
+# wheel index.  The code runs on CPU as well (that is how the smoke tests here
+# were executed), but reproducing the paper's numbers needs a GPU.
+torch>=1.13
+torchvision>=0.14
+numpy>=1.21
+Pillow>=9.0
+regex>=2022.1.18
+ftfy>=6.1
+prettytable>=3.0
