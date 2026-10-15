@@ -1,1 +1,11 @@
 pretrained/
+
+data/
+.venv/
+__pycache__/
+*.pyc
+logs/
+mlflow.db
+mlruns/
+mlartifacts/
+*.pth.tmp

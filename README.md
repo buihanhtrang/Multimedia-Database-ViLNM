@@ -67,6 +67,9 @@ which is the noisy-correspondence pattern of Fig. 1(b) / Fig. 3.
 
 ## Train on the real benchmarks
 
+> Training on a small local GPU, in resumable sessions with MLflow tracking:
+> see [docs/TRAINING.md](docs/TRAINING.md) (Vietnamese) and `tools/train_session.sh`.
+
 Lay the datasets out under `--root_dir`:
 
 ```

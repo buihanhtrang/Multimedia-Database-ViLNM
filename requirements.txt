@@ -11,3 +11,7 @@ Pillow>=9.0
 regex>=2022.1.18
 ftfy>=6.1
 prettytable>=3.0
+# experiment tracking (--mlflow True); psutil / nvidia-ml-py feed its system metrics
+mlflow>=2.14
+psutil>=5.9
+nvidia-ml-py>=12.0

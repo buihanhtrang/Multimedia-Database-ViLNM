@@ -1,0 +1,33 @@
+[project]
+name = "vilnm"
+version = "0.1.0"
+description = "Unofficial PyTorch implementation of ViLNM: Visual-Language Noise Modeling for Text-to-Image Person Retrieval"
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "torch>=1.13",
+    "torchvision>=0.14",
+    "numpy>=1.21",
+    "Pillow>=9.0",
+    "regex>=2022.1.18",
+    "ftfy>=6.1",
+    "prettytable>=3.0",
+    "mlflow>=2.14",
+    "psutil>=7.2.2",
+    "nvidia-ml-py>=13.615.71",
+]
+
+[tool.uv]
+# Flat script layout (train.py / test.py at the root): no wheel to build.
+package = false
+
+# torch/torchvision come from the CUDA 13.0 wheel index; everything else from PyPI.
+# For another driver swap the URL (e.g. .../whl/cu128) or use .../whl/cpu.
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

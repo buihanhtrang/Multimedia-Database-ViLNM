@@ -2,6 +2,7 @@
 
 import logging
 
+import torch
 from torch.utils.data import DataLoader
 
 from utils.simple_tokenizer import SimpleTokenizer
@@ -9,7 +10,7 @@ from .bases import ImageDataset, ImageTextDataset, TextDataset
 from .cuhkpedes import CUHKPEDES
 from .icfgpedes import ICFGPEDES
 from .rstpreid import RSTPReid
-from .sampler import RandomIdentitySampler
+from .sampler import EpochShuffleSampler, RandomIdentitySampler
 from .synthetic import SyntheticPEDES
 from .preprocessing import build_transforms
 
@@ -44,16 +45,19 @@ def build_dataloader(args):
         tokenizer=tokenizer, use_nta=args.use_nta, nta_rate=args.nta_rate,
         nta_p1=args.nta_p1, nta_p2=args.nta_p2, seed=args.seed)
 
-    common = dict(num_workers=args.num_workers, pin_memory=False)
+    # No persistent_workers: each epoch's workers must be re-forked so they see
+    # the captions NTAState.resample() rebuilt in the main process.
+    common = dict(num_workers=args.num_workers, pin_memory=torch.cuda.is_available())
     if args.sampler == "identity":
         train_loader = DataLoader(
             train_set, batch_size=args.batch_size, drop_last=True,
             sampler=RandomIdentitySampler(dataset.train, args.batch_size,
-                                          args.num_instance),
+                                          args.num_instance, seed=args.seed),
             **common)
     else:
-        train_loader = DataLoader(train_set, batch_size=args.batch_size,
-                                  shuffle=True, drop_last=True, **common)
+        train_loader = DataLoader(
+            train_set, batch_size=args.batch_size, drop_last=True,
+            sampler=EpochShuffleSampler(len(train_set), seed=args.seed), **common)
 
     split = dataset.val if args.val_dataset == "val" and dataset.val else dataset.test
     gallery = ImageDataset(split["image_pids"], split["img_paths"], test_transforms)

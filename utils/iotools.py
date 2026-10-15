@@ -35,8 +35,27 @@ def load_train_configs(path: str):
 
 
 def save_checkpoint(state: dict, path: str):
+    """Write atomically: a crash mid-save leaves the previous file intact."""
     mkdir_if_missing(op.dirname(path))
-    torch.save(state, path)
+    tmp = path + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def get_rng_state() -> dict:
+    state = {"python": random.getstate(), "numpy": np.random.get_state(),
+             "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state: dict):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
 
 
 def load_checkpoint(path: str, map_location="cpu"):

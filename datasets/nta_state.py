@@ -77,6 +77,22 @@ class NTAState:
         self.last_counts = counts
         return counts
 
+    def state_dict(self) -> dict:
+        """Everything `resample()` and `tokens()` depend on, for exact resume."""
+        return {"noise": self.noise, "current": self.current,
+                "src_index": self.src_index, "rng": self.rng.getstate(),
+                "last_counts": self.last_counts}
+
+    def load_state_dict(self, state: dict):
+        if len(state["noise"]) != len(self.original):
+            raise ValueError(f"NTA state holds {len(state['noise'])} captions, "
+                             f"dataset has {len(self.original)}")
+        self.noise = state["noise"]
+        self.current = state["current"]
+        self.src_index = state["src_index"]
+        self.rng.setstate(state["rng"])
+        self.last_counts = state["last_counts"]
+
     def stats(self):
         total = sum(len(c) for c in self.original) or 1
         n_mask, n_replace, n_delete = self.last_counts

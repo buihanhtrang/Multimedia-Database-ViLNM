@@ -18,7 +18,7 @@ Optimisation follows IRRA: Adam, lr 1e-5, 5 warmup epochs, cosine decay,
 import argparse
 import os.path as op
 
-
+# Hàm helper để chuyển đổi chuỗi thành boolean, được sử dụng trong argparse để xử lý các đối số boolean từ dòng lệnh.
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -119,9 +119,31 @@ def get_args(argv=None):
                         "used by the smoke tests")
     p.add_argument("--save_last", type=str2bool, default=True,
                    help="write last.pth after every epoch")
-    p.add_argument("--save_optimizer", type=str2bool, default=False,
-                   help="include optimizer/scheduler state in last.pth so training "
-                        "can be resumed exactly; triples the file size")
+    p.add_argument("--save_optimizer", type=str2bool, default=True,
+                   help="include optimizer/scheduler/scaler/NTA/RNG state in last.pth "
+                        "so training resumes exactly; triples the file size")
+
+    # ---------------- sessions: stop early, resume later ----------------
+    p.add_argument("--stop_after_epochs", type=int, default=0,
+                   help="finish at most N epochs in this session, then save and exit "
+                        "(0 = no limit)")
+    p.add_argument("--stop_after_steps", type=int, default=0,
+                   help="run at most N optimizer steps in this session, then save "
+                        "mid-epoch and exit (0 = no limit)")
+    p.add_argument("--max_hours", type=float, default=0.0,
+                   help="time budget for this session; when exceeded, save mid-epoch "
+                        "and exit (0 = no limit)")
+    p.add_argument("--ckpt_every_minutes", type=float, default=30.0,
+                   help="also write last.pth mid-epoch every N minutes, so a crash "
+                        "loses at most that much work (0 = only at epoch end)")
+
+    # ---------------- experiment tracking ----------------
+    p.add_argument("--mlflow", type=str2bool, default=False)
+    p.add_argument("--mlflow_uri", default="sqlite:///mlflow.db")
+    p.add_argument("--mlflow_experiment", default="",
+                   help="experiment name (default: the dataset name)")
+    p.add_argument("--mlflow_system_metrics", type=str2bool, default=True,
+                   help="log CPU/RAM/GPU usage alongside the training metrics")
 
     args = p.parse_args(argv)
     args.img_size = tuple(args.img_size)

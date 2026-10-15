@@ -12,7 +12,10 @@ Checks, in order:
      * NTA's elimination ratio landed near `--nta_rate`
      * the mask/replace/delete mix matches p1 / p2
 3. `test.py` reloads `best.pth` and reproduces the training run's metrics exactly
-4. `--resume` restarts from `last.pth`
+4. `--resume` restarts from `last.pth`; a run split into sessions (stopped at an
+   epoch boundary and mid-epoch) ends with bit-identical weights, best result,
+   NTA captions and MLflow run id to one run straight through; Ctrl+C saves a
+   resumable mid-epoch checkpoint
 5. every ablation row of Table II, plus the `--use_ndf` / `--use_id` switches
 6. the identity sampler (`--sampler identity`)
 
@@ -122,6 +125,81 @@ def best_from_train(out):
 # --------------------------------------------------------------------------- #
 # the suite
 # --------------------------------------------------------------------------- #
+def _load(path):
+    import torch
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def sessions_equivalence(common, results):
+    """3 epochs straight vs. the same run cut at an epoch boundary and mid-epoch."""
+    db = os.path.join(LOGDIR, "mlflow.db")
+    base = [*common, "--num_epoch", "3", "--batch_size", "8", "--log_period", "2",
+            "--max_steps_per_epoch", "6", "--eval_period", "1",
+            "--nta_warmup_epochs", "1", "--ckpt_every_minutes", "0",
+            "--mlflow", "True", "--mlflow_uri", f"sqlite:///{db}",
+            "--mlflow_system_metrics", "False"]
+    run("sessions: straight run (3 epochs)", ["train.py", "--name", "eqA", *base], results)
+    last_b = os.path.join(LOGDIR, "eqB", "last.pth")
+    run("sessions: part 1 (--stop_after_epochs 1)",
+        ["train.py", "--name", "eqB", *base, "--stop_after_epochs", "1"], results)
+    run("sessions: part 2 (--stop_after_steps 4, stops mid-epoch 2)",
+        ["train.py", "--name", "eqB", *base, "--stop_after_steps", "4",
+         "--resume", last_b], results)
+    mid = _load(last_b) if os.path.exists(last_b) else {}
+    check("part 2 paused mid-epoch", mid.get("epoch") == 2 and mid.get("step") == 4
+          and not mid.get("epoch_complete", True), results,
+          f"(epoch {mid.get('epoch')}, step {mid.get('step')})")
+    run_id = mid.get("mlflow_run_id")
+    run("sessions: part 3 (to the end)",
+        ["train.py", "--name", "eqB", *base, "--resume", last_b], results)
+
+    a_path = os.path.join(LOGDIR, "eqA", "last.pth")
+    if not (os.path.exists(a_path) and os.path.exists(last_b)):
+        check("both runs wrote last.pth", False, results)
+        return
+    a, b = _load(a_path), _load(last_b)
+    diff = max((a["model"][k].float() - b["model"][k].float()).abs().max().item()
+               for k in a["model"])
+    check("split run weights == straight run weights", diff == 0.0, results,
+          f"(max |diff| {diff:.3g})")
+    check("split run best == straight run best",
+          a["best"] == b["best"], results, f"(R@1 {a['best']['R1']:.3f} vs "
+          f"{b['best']['R1']:.3f})")
+    check("split run NTA captions == straight run",
+          a["nta"]["current"] == b["nta"]["current"], results)
+    check("one MLflow run across the 3 sessions",
+          run_id is not None and b.get("mlflow_run_id") == run_id, results)
+
+
+def sigint_pause(common, results):
+    """Ctrl+C mid-epoch saves a resumable checkpoint instead of losing the epoch."""
+    import signal
+    name = "sigint"
+    cmd = [sys.executable, "-u", "train.py", "--name", name, *common,
+           "--num_epoch", "50", "--batch_size", "8", "--log_period", "1",
+           "--eval_period", "0"]
+    print(f"\n=== Ctrl+C mid-epoch\n    $ python {' '.join(cmd[2:])}", flush=True)
+    proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace")
+    out = []
+    for line in proc.stdout:
+        out.append(line)
+        if "iter[3/" in line:
+            proc.send_signal(signal.SIGINT)
+            break
+    out.extend(proc.stdout)
+    proc.wait(timeout=120)
+    out = "".join(out)
+    ckpt = os.path.join(LOGDIR, name, "last.pth")
+    state = _load(ckpt) if os.path.exists(ckpt) else {}
+    check("Ctrl+C exits cleanly", proc.returncode == 0, results,
+          f"(exit {proc.returncode})")
+    check("Ctrl+C saved a mid-epoch checkpoint",
+          "session stopped by SIGINT" in out and state.get("step", 0) >= 3
+          and not state.get("epoch_complete", True), results,
+          f"(epoch {state.get('epoch')}, step {state.get('step')})")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--full_model", action="store_true",
@@ -223,7 +301,11 @@ def main():
                           "--max_steps_per_epoch", "3", "--eval_period", "0",
                           "--save_last", "False", "--resume", last_ckpt],
                          results)
-        check("resumed at epoch 5", "at epoch 5" in resume_out, results)
+        check("resumed after epoch 4", "end of epoch 4" in resume_out, results)
+
+    # -- 5b. split sessions == one straight run ---------------------------- #
+    sessions_equivalence(common, results)
+    sigint_pause(common, results)
 
     # -- 6. ablations (Table II) and loss switches ------------------------- #
     ablations = [
