@@ -23,7 +23,7 @@ letting deletions accumulate until the caption is empty.
 """
 
 import random
-from typing import List, Sequence
+from typing import List, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -68,7 +68,7 @@ class NoiseTokenAware(nn.Module):
 def eliminate_tokens(tokens: Sequence[int],
                      noise: Sequence[float],
                      mask_token: int,
-                     vocab_limit: int,
+                     vocab_limit: Union[int, Sequence[int]],
                      p1: float = 0.6,
                      p2: float = 0.8,
                      rng: random.Random = random):
@@ -79,7 +79,9 @@ def eliminate_tokens(tokens: Sequence[int],
         noise:  matching r' values, same length as `tokens`.
         mask_token: id of `<|mask|>`.
         vocab_limit: exclusive upper bound for "random replace" ids (keeps the
-            replacement inside the regular vocabulary, never a special token).
+            replacement inside the regular vocabulary, never a special token),
+            or an explicit list of ids to draw from (SigLIP's 256k vocabulary
+            is restricted to the words of the training captions).
     Returns:
         (kept_tokens, src_index, counts) -- `src_index[j]` is the position in
         `tokens` that produced `kept_tokens[j]`, which lets the trainer scatter
@@ -102,7 +104,10 @@ def eliminate_tokens(tokens: Sequence[int],
             src.append(i)
             counts[MASK] += 1
         elif p < p2:
-            out.append(rng.randrange(vocab_limit))
+            if isinstance(vocab_limit, int):
+                out.append(rng.randrange(vocab_limit))
+            else:
+                out.append(vocab_limit[rng.randrange(len(vocab_limit))])
             src.append(i)
             counts[REPLACE] += 1
         else:

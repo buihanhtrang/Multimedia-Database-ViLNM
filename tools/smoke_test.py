@@ -18,6 +18,7 @@ Checks, in order:
    resumable mid-epoch checkpoint
 5. every ablation row of Table II, plus the `--use_ndf` / `--use_id` switches
 6. the identity sampler (`--sampler identity`)
+7. `--backbone siglip2`: train with NTA, reload with `test.py`, resume
 
 By default this uses `--tiny_model`, a 2-layer/128-wide CLIP, so the whole suite
 finishes in a couple of minutes on a CPU and writes ~30 MB checkpoints instead of
@@ -200,6 +201,36 @@ def sigint_pause(common, results):
           f"(epoch {state.get('epoch')}, step {state.get('step')})")
 
 
+def siglip_backbone(a, results):
+    """Same pipeline with `--backbone siglip2` (tiny unless --full_model)."""
+    common = ["--dataset_name", DATASET, "--num_workers", "0", "--backbone", "siglip2",
+              "--img_size", "96", "32"] + ([] if a.full_model else ["--tiny_model", "True"])
+    out = run("siglip2: train (3 epochs, all components)",
+              ["train.py", "--name", "siglip", *common, "--num_epoch", "3",
+               "--batch_size", "8", "--log_period", "5", "--eval_period", "1"],
+              results)
+    stats = nta_stats(out)
+    if check("siglip2: NTA ran", bool(stats), results) and stats:
+        check("siglip2: elimination ratio ~= nta_rate",
+              abs(stats[-1]["eliminated_ratio"] - 0.2) < 0.05, results,
+              f"{stats[-1]['eliminated_ratio']:.4f}")
+    run_dir = os.path.join(LOGDIR, "siglip")
+    best, last = os.path.join(run_dir, "best.pth"), os.path.join(run_dir, "last.pth")
+    if os.path.exists(best):
+        test_out = run("siglip2: reload best.pth with test.py",
+                       ["test.py", "--config_file", os.path.join(run_dir, "configs.json"),
+                        "--checkpoint", best, "--device", "cpu"], results)
+        trained, reloaded = best_from_train(out), t2i_row(test_out)
+        check("siglip2: reloaded metrics match", bool(trained and reloaded) and all(
+            abs(trained[k] - reloaded[k]) < 1e-3 for k in ("R1", "mAP")), results)
+    if os.path.exists(last):
+        out = run("siglip2: resume from last.pth",
+                  ["train.py", "--name", "siglip", *common, "--num_epoch", "4",
+                   "--batch_size", "8", "--max_steps_per_epoch", "3",
+                   "--eval_period", "0", "--resume", last], results)
+        check("siglip2: resumed after epoch 3", "end of epoch 3" in out, results)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--full_model", action="store_true",
@@ -335,6 +366,9 @@ def main():
          "--max_steps_per_epoch", "3", "--eval_period", "0",
          "--save_last", "False"],
         results)
+
+    # -- 8. SigLIP 2 backbone ---------------------------------------------- #
+    siglip_backbone(a, results)
 
     if not a.keep_logs and os.path.isdir(LOGDIR):
         shutil.rmtree(LOGDIR, ignore_errors=True)

@@ -180,6 +180,24 @@ def test_nta_state_scatters_through_deletions():
     assert np.allclose(state.noise[0], [0.9, 0.2, 0.7], atol=1e-6), state.noise[0]
 
 
+def test_nta_state_random_scores_ignore_model():
+    """--nta_random: elimination ignores r' but keeps the same average rate."""
+    captions = [list(range(10, 60))] * 200
+    state = NTAState(captions, 49408, 49406, rate=0.2, seed=0, random_scores=True)
+    row = np.concatenate([[0.0], np.full(50, 0.9, np.float32)])
+    row[1:26] = 0.0                       # model says: first half clean, second noisy
+    for i in range(len(captions)):
+        state.update(i, row)
+    state.resample()
+    assert abs(state.stats()["eliminated_ratio"] - 0.2) < 0.02
+    kept = np.zeros(50)
+    for src in state.src_index:
+        kept[src] += 1
+    # Both halves eliminated equally, unlike NTA which would spare the first half.
+    assert abs(kept[:25].mean() - kept[25:].mean()) < 0.05 * len(captions)
+    assert np.allclose(state.noise[0], row[1:])     # r' is still recorded
+
+
 # --------------------------------------------------------------------------- #
 # Objectives -- Eqs. (6)-(9)
 # --------------------------------------------------------------------------- #
@@ -281,6 +299,110 @@ def test_rank_minp_penalises_late_hard_match():
     assert abs(mINP.item() - 100.0 * 3 / 12) < 1e-3, mINP.item()
 
 
+# --------------------------------------------------------------------------- #
+# SigLIP 2 backbone (--backbone siglip2)
+# --------------------------------------------------------------------------- #
+def _siglip_args(*extra):
+    from utils.options import get_args
+    return get_args(["--backbone", "siglip2", "--tiny_model", "True",
+                     "--img_size", "96", "32", *extra])
+
+
+def test_siglip_tokenizer_matches_hf_layout():
+    from transformers import AutoTokenizer
+    from datasets.bases import tokenize
+    from utils.hf_tokenizer import SiglipTokenizer, hf_from_pretrained
+
+    tok = SiglipTokenizer()
+    assert tok.sot_token is None and tok.eot_token == 1 and tok.mask_token == 4
+    caption = "Người đàn ông mặc Áo sơ mi trắng, quần jean xanh và đeo ba lô đen."
+    hf = hf_from_pretrained(AutoTokenizer, "google/siglip2-base-patch16-256")
+    ref = hf(caption.lower(), padding="max_length", max_length=64,
+             truncation=True)["input_ids"]
+    assert tokenize(caption, tok, 64).tolist() == ref, "must match SigLIP's own layout"
+    assert 1 not in tok.encode("áo <eos> đỏ"), "a literal <eos> must not end a caption"
+
+
+def test_pad_tokens_without_start_token():
+    from datasets.bases import pad_tokens
+    assert pad_tokens([5, 6], None, 1, 6).tolist() == [5, 6, 1, 0, 0, 0]
+    # Truncation keeps room for [EOS] only.
+    assert pad_tokens(list(range(10, 20)), None, 1, 6).tolist() == [10, 11, 12, 13, 14, 1]
+
+
+def test_nta_state_offset_zero():
+    """SigLIP captions have no [SOS]: word j is at padded position j."""
+    state = NTAState([[10, 11, 12]], mask_token=4, vocab_limit=[10, 11, 12],
+                     rate=0.2, seed=0, offset=0)
+    state.update(0, np.array([0.9, 0.1, 0.7, 0.0, 0.0], dtype=np.float32))
+    assert np.allclose(state.noise[0], [0.9, 0.1, 0.7]), state.noise[0]
+
+
+def test_eliminate_tokens_replacement_from_vocab_list():
+    vocab = [1000, 2000, 3000]
+    kept, _, counts = eliminate_tokens([5] * 100, [1.0] * 100, 4, vocab,
+                                       p1=0.0, p2=1.0, rng=random.Random(3))
+    assert counts[1] == 100 and set(kept) <= set(vocab)
+
+
+def test_siglip_position_resize_matches_hf_interpolation():
+    import copy
+    from transformers import SiglipVisionConfig
+    from transformers.models.siglip.modeling_siglip import SiglipVisionEmbeddings
+    from model.siglip_model import resize_position_embedding
+
+    torch.manual_seed(0)
+    emb = SiglipVisionEmbeddings(SiglipVisionConfig(hidden_size=32, image_size=64,
+                                                    patch_size=16))
+    px = torch.randn(2, 3, 96, 32)
+    ref = emb(px, interpolate_pos_encoding=True)
+    ours = copy.deepcopy(emb)
+    resize_position_embedding(ours, 96, 32)
+    assert ours.position_embedding.weight.shape[0] == 6 * 2
+    assert torch.allclose(ours(px), ref, atol=1e-5)
+
+
+def test_siglip_backbone_outputs():
+    from model.siglip_model import SiglipBackbone
+    torch.manual_seed(0)
+    bb = SiglipBackbone("google/siglip2-base-patch16-256", (96, 32), tiny=True).eval()
+    g, patches = bb.encode_image(torch.randn(2, 3, 96, 32))
+    assert g.shape == (2, 64) and patches.shape == (2, 12, 64)
+    ids = torch.zeros(2, 64, dtype=torch.long)
+    ids[:, :3] = torch.tensor([[700, 800, 1], [900, 1, 0]])
+    tg, words = bb.encode_text(ids)
+    assert words.shape == (2, 64, 64)
+    assert torch.allclose(tg, words[:, -1], atol=1e-5), "global = head(last position)"
+    assert not bb.text.embeddings.token_embedding.weight.requires_grad
+    try:
+        bb.encode_text(ids[:, :32])
+        raise AssertionError("short captions must be rejected")
+    except ValueError:
+        pass
+
+
+def test_vilnm_siglip_forward_backward():
+    from model.build import build_model
+    torch.manual_seed(0)
+    args = _siglip_args()
+    assert args.text_length == 64 and args.eot_token == 1
+    model = build_model(args, num_classes=4)
+    ids = torch.zeros(2, 64, dtype=torch.long)
+    ids[0, :4] = torch.tensor([700, 4, 800, 1])           # word, <mask>, word, <eos>
+    ids[1, :2] = torch.tensor([900, 1])
+    mask = model.text_word_mask(ids)
+    assert mask[0].nonzero().flatten().tolist() == [0, 1, 2]
+    assert mask[1].nonzero().flatten().tolist() == [0]
+    ret = model({"images": torch.randn(2, 3, 96, 32), "caption_ids": ids,
+                 "pids": torch.tensor([0, 1])})
+    assert ret["nta_noise"].shape == (2, 64)
+    assert (ret["nta_noise"][~mask] == 0).all()
+    sum(v for k, v in ret.items() if k.endswith("_loss")).backward()
+    emb = model.base_model.text.embeddings.token_embedding.weight
+    assert emb.grad is None, "frozen token table must not receive gradients"
+    assert model.base_model.visual.embeddings.position_embedding.weight.grad is not None
+
+
 def _run_all():
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and callable(f)]
@@ -298,3 +420,4 @@ def _run_all():
 
 if __name__ == "__main__":
     sys.exit(1 if _run_all() else 0)
+

@@ -1,7 +1,7 @@
 # Hướng dẫn train ViLNM theo phiên trên máy cá nhân
 
 Tài liệu này hướng dẫn train phiên bản đầy đủ của ViLNM (NTA + LA + JII) trên
-CUHK-PEDES bằng một GPU nhỏ (đã đo trên RTX 3050 6 GB). Quá trình train được chia
+CUHK-PEDES, và trên VN3K tiếng Việt với backbone SigLIP 2 (mục 9), bằng một GPU nhỏ (đã đo trên RTX 3050 6 GB). Quá trình train được chia
 thành nhiều phiên ngắn, nên bạn vẫn dùng máy cho việc khác được. Nội dung gồm:
 cài môi trường, đo thời gian, chạy và dừng/tiếp tục, theo dõi bằng MLflow, đánh
 giá kết quả, và chuyển sang server khi cần.
@@ -397,7 +397,209 @@ từng bit, vì các kernel CUDA khác nhau giữa các thế hệ GPU.
 
 ---
 
-## 9. Xử lý sự cố
+## 9. Bộ VN3K (tiếng Việt, có nhiễu)
+
+```
+data/VN3K/
+├── vn3k.json                      # 2.000 id / 4.302 ảnh / 8.604 caption train; 1.000 id / 2.000 ảnh test; không có val
+├── images/
+├── noise_sentence/VN3K-VI_{0.1..0.8}.npy                 # tráo cả câu sang người khác
+└── noisy_color/vn3k_attribute_noise_{10..70}pct.json     # đổi từ chỉ màu
+```
+
+```bash
+# sạch
+.venv/bin/python train.py --dataset_name VN3K --name vn3k_clean ...
+# nhiễu câu 20%
+.venv/bin/python train.py --dataset_name VN3K --name vn3k_sent20 --noise_file noise_sentence/VN3K-VI_0.2.npy ...
+# nhiễu màu "20%"
+.venv/bin/python train.py --dataset_name VN3K --name vn3k_color20 --noise_file noisy_color/vn3k_attribute_noise_20pct.json ...
+```
+
+- Nhiễu chỉ áp lên tập train; tập test luôn sạch. Log in ra tỉ lệ caption thực sự
+  bị thay đổi (`caption noise from ...`).
+- **Tỉ lệ nhiễu thật của `noisy_color` cao hơn tên file**, vì nhiều caption ghi
+  `is_real: true` vẫn bị đổi màu: file 10% thực tế là 28,2%, 20% là 36,1%,
+  30% là 44,1%, 40% là 51,8%, 50% là 60,0%, 60% là 67,8%, 70% là 75,7%.
+  Code dùng nội dung caption, không dựa vào cờ `is_real`. Khi báo cáo, ghi tỉ lệ
+  thật hoặc nói rõ điều này.
+- `noise_sentence` có tỉ lệ đúng như tên file.
+- **CLIP (tiếng Anh) gần như không đọc được tiếng Việt.** Trung vị 97 token BPE
+  mỗi caption và 77,8% caption bị cắt ở 77 token (CUHK: 24 token, 0,3%); zero-shot
+  R@1 chỉ 0,18. Vì vậy VN3K dùng backbone **SigLIP 2** (mục 9.1).
+
+### 9.1 Backbone SigLIP 2 (`--backbone siglip2`)
+
+`google/siglip2-base-patch16-256` là model đa ngôn ngữ (tokenizer Gemma 256k), được
+chọn sau khi sàng lọc zero-shot trên VN3K (`tools/zeroshot_encoders.py`, kết quả ở
+`logs/zeroshot_VN3K.json`): R@1 18,68, so với CLIP 0,18 và ViCLIP-OT / ViSigLIP-OT
+dưới 5,4. Chỉ 1% caption dài hơn 64 token.
+
+SigLIP 2 khác CLIP ở ba chỗ. Code xử lý như sau (`model/siglip_model.py`):
+
+| | CLIP | SigLIP 2 trong ViLNM |
+|---|---|---|
+| Vector toàn cục của ảnh | token [CLS] | đầu MAP (attention pooling), chính là vector SigLIP dùng để so với text |
+| Vector toàn cục của câu | vị trí [EOS] | vị trí **cuối cùng** của chuỗi 64 token (đúng cách SigLIP được train) |
+| Token cho LA / NTA | các token còn lại | 192 patch (ảnh); `head` áp lên từng vị trí (câu) |
+| Dạng caption | `<sot> từ… <eot> 0…` (77) | `từ… <eos> <pad>…` (64), viết thường |
+| Chuẩn hoá ảnh | mean/std của CLIP | 0,5 / 0,5 |
+
+Ngoài ra:
+- **NTA:** phép "random replace" chỉ lấy từ trong vốn từ của caption train, không
+  lấy trong cả 256k token; phép "mask" dùng `<mask>` (id 4) của Gemma.
+- **Bảng token embedding** (197M tham số) được đóng băng
+  (`--freeze_token_embedding True`). Cách này tiết kiệm khoảng 2,4 GB cho gradient
+  và trạng thái Adam.
+- **Gradient checkpointing** (`--grad_ckpt True`) là bắt buộc trên 6 GB.
+- **Lưới vị trí 16×16** được nội suy (bicubic) một lần sang kích thước train.
+- Trọng số nằm ở `pretrained/hf` (HF_HOME). Lần đầu chạy sẽ tự tải nếu chưa có.
+
+Kiểm tra trước khi train (khoảng 1 phút):
+
+```bash
+unset LD_LIBRARY_PATH
+.venv/bin/python tools/verify_siglip_port.py
+#  [1] khớp HF gốc (chênh 0)  [2] tokenize giống processor  [3] zero-shot qua pipeline
+.venv/bin/python tests/test_modules.py        # 27 test, gồm 7 test SigLIP
+```
+
+**Độ phân giải ảnh.** Đây là quyết định cần chốt trước khi train. Zero-shot (chưa
+train, chỉ dùng vector toàn cục) trên tập test VN3K:
+
+| `--img_size` | 256 256 | 384 256 | 384 192 | 320 160 | 256 128 | 384 128 (paper) |
+|---|---|---|---|---|---|---|
+| R@1 | 18,30 | 16,92 | 14,78 | 11,42 | 7,98 | 6,85 |
+
+SigLIP được train trên ảnh vuông, nên ảnh càng hẹp chiều ngang thì càng tụt; ảnh
+VN3K có tỉ lệ cao/rộng trung vị khoảng 2,7. Fine-tune sẽ bù lại một phần.
+
+**Bộ nhớ và thời gian** (RTX 3050 6 GB, `--amp True`, 8 worker, có gradient
+checkpointing; không bật thì cả batch 8 cũng OOM). File kết quả ở
+`logs/bench_siglip_*.json`:
+
+| `--img_size` | batch | VRAM | s/bước | 1 epoch | 30 epoch |
+|---|---|---|---|---|---|
+| 384 128 | 16 | 4,2 GB | 0,46 | 4 phút | 2h02 |
+| 384 128 | **32** | 4,5 GB | 0,76 | 3 phút | **1h41** |
+| 384 128 | 48 | 4,6 GB | 1,06 | 3 phút | 1h35 |
+| 384 128 | 64 | OOM | | | |
+| 256 256 | 16 | 4,3 GB | 0,54 | 5 phút | 2h30 |
+| 256 256 | **32** | 4,6 GB | 0,91 | 4 phút | **2h07** |
+| 256 256 | 48 | OOM | | | |
+
+Mỗi lần đánh giá mất khoảng 52 giây (đã tính vào cột 30 epoch, với 5 epoch đánh
+giá một lần). Batch 32 là lựa chọn hợp lý: nhiều negative cho loss tương phản hơn
+batch 8 khi train CUHK, mà vẫn còn dư khoảng 1,4 GB VRAM.
+
+**Chạy:**
+
+```bash
+# một lượt đầy đủ, chia phiên như CUHK
+NAME=vn3k_siglip_full DATASET=VN3K BACKBONE=siglip2 BATCH=32 NUM_EPOCH=30 EPOCHS=0 \
+    tools/train_session.sh --img_size 384 128
+
+# có nhiễu câu 50%
+NAME=vn3k_siglip_sent50 DATASET=VN3K BACKBONE=siglip2 BATCH=32 NUM_EPOCH=30 EPOCHS=0 \
+    tools/train_session.sh --img_size 384 128 --noise_file noise_sentence/VN3K-VI_0.5.npy
+
+# đánh giá lại một checkpoint
+.venv/bin/python test.py --config_file logs/VN3K/vn3k_siglip_full/configs.json \
+    --checkpoint logs/VN3K/vn3k_siglip_full/best.pth
+```
+
+Mỗi lượt chạy ghi `best.pth` khoảng 1,5 GB và `last.pth` khoảng 3 GB (có trạng thái
+optimizer). Xoá `last.pth` khi lượt chạy đã xong và không cần resume nữa.
+
+Một lượt 30 epoch chỉ mất khoảng 2 giờ, nên có thể đặt `EPOCHS=0` (chạy một mạch)
+thay vì chia phiên 4 epoch. Mọi tham số định hình lượt chạy (`--img_size`, batch,
+backbone, file nhiễu…) phải giữ nguyên giữa các phiên của cùng một `NAME`.
+
+### 9.2 Chạy ablation và xuất báo cáo
+
+Lưới ablation gồm **6 cấu hình × các mức nhiễu**. Mỗi ô là một lượt `train.py`
+bình thường, nằm ở `logs/VN3K/abl_<cấu hình>_<nhiễu>/`.
+
+| Cấu hình | Tắt gì |
+|---|---|
+| `full` | không tắt |
+| `no_nta` | `--use_nta False` |
+| `nta_random` | `--nta_random True`: vẫn loại ~20% token nhưng chọn ngẫu nhiên, không theo ảnh (đối chứng: NTA có tác dụng vì chọn đúng từ nhiễu hay chỉ như dropout) |
+| `no_la` | `--loss_on_local False --sim_alpha 1 --sim_beta 0` |
+| `no_jii` | `--use_jii False` (chỉ còn NDF + ID) |
+| `baseline` | tắt cả ba |
+
+Mức nhiễu: `clean`, `sent10`…`sent80` (tráo câu), `color10`…`color70` (đổi màu).
+NTA xử lý nhiễu *trong* câu (vài từ sai), nên nó được kiểm chứng trên nhiễu màu;
+nhiễu tráo câu (cả câu sai) dùng cho LA/JII.
+
+```bash
+.venv/bin/python tools/ablation.py --status        # xem lượt nào xong/dở/chưa chạy
+.venv/bin/python tools/ablation.py                 # đợt 1 (NTA): {full, no_nta, nta_random} × {clean, color30, color50}, ~17 h
+.venv/bin/python tools/ablation.py --hours 6       # chỉ chạy 6 giờ rồi lưu và dừng
+.venv/bin/python tools/ablation.py --configs full no_la no_jii baseline --noise clean sent50   # đợt sau
+.venv/bin/python tools/ablation_report.py          # bảng + biểu đồ, chạy lúc nào cũng được
+.venv/bin/python tools/ablation.py --keep_all ...  # giữ hết: last.pth + snapshots/ (~7 GB/lượt)
+.venv/bin/python tools/nta_inspect.py --runs abl_full_color50 abl_no_nta_color50
+```
+
+- `--keep_all` (= `--keep_last` + `--save_snapshots True`): `snapshots/epoch_XX.pth` là
+  weight ở mỗi lần đánh giá, `snapshots/nta_epoch_XX.pt` là r' và caption NTA tạo ra sau
+  mỗi epoch. Muốn train tiếp quá 30 epoch: `--num_epoch 40 --resume .../last.pth`.
+- `--keep_nta` (bản gọn cho việc nghiên cứu NTA, ~1–2 GB/lượt): giữ `nta_epoch_XX.pt` mọi
+  epoch và weight epoch cuối (`--save_snapshots True --snapshot_weights final`);
+  `best.pth` chỉ được giữ khi lần đánh giá tốt nhất không phải epoch cuối; `last.pth` bị xoá.
+  `--rest_minutes 10` cho máy nghỉ giữa hai lượt. Ví dụ (mốc 20%, đánh giá mỗi epoch):
+  `tools/ablation.py --configs full no_nta nta_random --noise sent20 color20 --keep_nta --rest_minutes 10 --eval_period 1`.
+- `tools/nta_inspect.py` soi NTA bằng nhiễu màu (biết chính xác từ nào sai):
+  `examples.png` (bản đồ nhiệt từ–ảnh, r' từng từ), `detection.png`, `top_words.png`,
+  `summary.md`. Ngoài AUC còn hai phép đối chứng: AUC chỉ theo vị trí trong câu, và
+  "cùng chỗ": r' của màu sai so với màu đúng ở cùng vị trí, cùng ảnh.
+  `--ckpt snapshots/epoch_10.pth` để xem một epoch bất kỳ.
+- `tools/module_metrics.py`: metric riêng cho từng module, tính từ weight epoch cuối
+  (lưu đệm trong `<lượt>/module_metrics.json`, kết quả ở `results/module_metrics/`).
+  JII: khoảng cách ảnh đúng − ảnh sai giống nhất, độ gom cụm cùng người. LA: từ chỉ
+  bộ phận (tóc/áo/quần/giày) có nhìn đúng vùng ảnh không. Học thuộc nhiễu: phép thử
+  sent50 trên tập train. Cần GPU rảnh (khoảng 2–3 phút/lượt); `--limit 30 --device cpu`
+  để thử nhanh.
+- `tools/sim_weights.py`: chấm lại các lượt có LA với trọng số
+  S = α·S_global + (1−α)·S_local khác nhau (mặc định α ∈ {0; 0,25; 0,5; 0,75; 1}),
+  không train lại. Lưu đệm trong `<lượt>/sim_weights.json`, kết quả ở `results/sim_weights/`.
+
+- Gọi lại `tools/ablation.py` bao nhiêu lần cũng được: lượt đã xong thì bỏ qua,
+  lượt đang dở thì resume.
+- **Dừng:** nhấn Ctrl+C, hoặc `touch logs/VN3K/STOP_ABLATION` từ terminal khác.
+  Lượt đang chạy sẽ lưu giữa epoch rồi thoát.
+- Khi một lượt xong, `last.pth` (3 GB) bị xoá. Những file được giữ lại: `best.pth`,
+  `history.json` (kết quả mọi lần đánh giá) và `nta_final.pt` (điểm nhiễu NTA cuối).
+  Thêm `--keep_last` nếu muốn giữ `last.pth`.
+- MLflow: experiment `VN3K-ablation`.
+
+Báo cáo nằm ở `results/ablation_VN3K/`:
+
+| File | Nội dung |
+|---|---|
+| `report.md` | ma trận R@1 / mAP / mINP; mức tụt khi bỏ từng module; global và local; NTA bắt nhiễu |
+| `results.csv` | số liệu thô, mỗi lượt một dòng |
+| `r1_vs_noise.png` | R@1 theo tỉ lệ nhiễu thật, mỗi cấu hình một đường |
+| `delta_r1.png` | R@1(Đầy đủ) − R@1(bỏ module), theo từng mức nhiễu |
+| `curves.png` | R@1 qua các epoch |
+
+Các quy ước trong báo cáo:
+- **Số chính lấy ở epoch cuối.** Best-on-test ghi trong ngoặc. VN3K không có tập
+  val, nên chọn epoch tốt nhất trên tập test sẽ làm đẹp số liệu, và mức đẹp lên
+  khác nhau giữa các cấu hình.
+- **Trục nhiễu dùng tỉ lệ đo được**, không dùng tên file (xem lưu ý về `noisy_color` ở trên).
+- **NTA bắt nhiễu** chỉ tính cho nhiễu màu. Với nhiễu màu ta biết chính xác từ nào
+  bị đổi, nên so được với điểm r' mà NTA gán cho từng token:
+  - AUC 0,5 là đoán bừa, 1,0 là hoàn hảo.
+  - Top-1 là tỉ lệ token "nhiễu nhất" theo NTA đúng là từ bị đổi.
+  - Với nhiễu câu không tính được, vì r' được trừ trung bình trong từng câu
+    (Eq. 4), nên không so sánh được giữa các câu.
+
+---
+
+## 10. Xử lý sự cố
 
 | Triệu chứng | Nguyên nhân / cách xử lý |
 |---|---|
@@ -411,7 +613,7 @@ từng bit, vì các kernel CUDA khác nhau giữa các thế hệ GPU.
 
 ---
 
-## 10. Bảng tham số mới
+## 11. Bảng tham số mới
 
 | Tham số | Mặc định | Ý nghĩa |
 |---|---|---|
@@ -424,6 +626,12 @@ từng bit, vì các kernel CUDA khác nhau giữa các thế hệ GPU.
 | `--mlflow_uri` | `sqlite:///mlflow.db` | nơi lưu; có thể là `http://host:5000` |
 | `--mlflow_experiment` | tên dataset | |
 | `--mlflow_system_metrics` | True | ghi CPU/RAM/GPU |
+| `--noise_file` | (trống) | file nhiễu `.npy`/`.json` cho caption train (mục 9) |
+| `--backbone` | `clip` | `siglip2` cho VN3K (mục 9.1) |
+| `--hf_model` | `google/siglip2-base-patch16-256` | model SigLIP 2 trên Hugging Face |
+| `--freeze_token_embedding` | True | siglip2: đóng băng bảng token 256k |
+| `--grad_ckpt` | True | siglip2: gradient checkpointing (bắt buộc trên 6 GB) |
+| `--text_length` | 0 = theo backbone | 77 cho clip, 64 cho siglip2 |
 
 Thay đổi hành vi so với trước:
 - epoch cuối cùng luôn được đánh giá, kể cả khi không chia hết cho `--eval_period`;

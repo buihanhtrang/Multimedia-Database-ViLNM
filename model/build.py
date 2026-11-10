@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .clip_model import build_CLIP_from_openai_pretrained
+from .siglip_model import SiglipBackbone
 from .layers import LocalAggregation
 from .nta import NoiseTokenAware
 from . import objectives
@@ -16,8 +17,8 @@ logger = logging.getLogger("ViLNM.model")
 class ViLNM(nn.Module):
     """Visual-Language Noise Modeling for text-to-image person retrieval.
 
-    Global features come from CLIP's [CLS]/[EOS] tokens; local features come
-    from the LA module (Eq. 1) applied to the patch-/word-level token
+    Global features come from CLIP's [CLS]/[EOS] tokens (SigLIP 2: its pooling
+    heads, see model/siglip_model.py); local features come from the LA module (Eq. 1) applied to the patch-/word-level token
     sequences.  The same token sequences feed the NTA module (Eqs. 2-5), whose
     output is the per-token elimination probability used to rebuild the training
     captions for the next epoch.
@@ -28,13 +29,25 @@ class ViLNM(nn.Module):
         self.args = args
         self.num_classes = num_classes
 
-        self.base_model, self.clip_cfg = build_CLIP_from_openai_pretrained(
-            args.pretrain_choice, (args.img_size[0], args.img_size[1]),
-            args.stride_size, vocab_size=args.vocab_size,
-            pretrained=not args.no_pretrained,
-            tiny=getattr(args, "tiny_model", False))
-        self.embed_dim = self.clip_cfg["embed_dim"]
+        self.backbone = getattr(args, "backbone", "clip")
+        if self.backbone == "siglip2":
+            self.base_model = SiglipBackbone(
+                args.hf_model, (args.img_size[0], args.img_size[1]),
+                pretrained=not args.no_pretrained,
+                tiny=getattr(args, "tiny_model", False),
+                freeze_token_embedding=args.freeze_token_embedding,
+                grad_ckpt=args.grad_ckpt)
+            self.embed_dim = self.base_model.embed_dim
+        else:
+            self.base_model, self.clip_cfg = build_CLIP_from_openai_pretrained(
+                args.pretrain_choice, (args.img_size[0], args.img_size[1]),
+                args.stride_size, vocab_size=args.vocab_size,
+                pretrained=not args.no_pretrained,
+                tiny=getattr(args, "tiny_model", False))
+            self.embed_dim = self.clip_cfg["embed_dim"]
         self.eot_token = args.eot_token
+        # Words start after CLIP's [SOS]; SigLIP captions have no start token.
+        self.text_offset = 0 if self.backbone == "siglip2" else 1
 
         # --- Local Aggregation (Eq. 1) -------------------------------------
         self.la_visual = LocalAggregation(self.embed_dim, args.la_reduction, args.la_dropout)
@@ -53,25 +66,31 @@ class ViLNM(nn.Module):
     # ------------------------------------------------------------------ #
     def encode_image(self, image):
         """Returns (v_global, v_local, patch_tokens)."""
-        x = self.base_model.encode_image(image)          # [B, 1+Nv, D]
-        v_global = x[:, 0, :]                            # [CLS] -> Eq. Sec III-A
-        v_local, patch_tokens = self.la_visual(x[:, 1:, :])
+        if self.backbone == "siglip2":
+            v_global, patches = self.base_model.encode_image(image)
+        else:
+            x = self.base_model.encode_image(image)      # [B, 1+Nv, D]
+            v_global, patches = x[:, 0, :], x[:, 1:, :]  # [CLS] -> Eq. Sec III-A
+        v_local, patch_tokens = self.la_visual(patches)
         return v_global, v_local, patch_tokens
 
     def text_word_mask(self, caption_ids):
-        """True for real word tokens, i.e. everything strictly between SOS and EOS."""
+        """True for real word tokens, i.e. everything between [SOS] (if any) and EOS."""
         is_eot = caption_ids == self.eot_token
         # First EOS position per row; captions always carry exactly one.
         eot_pos = is_eot.float().argmax(dim=-1)                       # [B]
-        idx = torch.arange(caption_ids.size(1), device=caption_ids.device)
-        return (idx.unsqueeze(0) > 0) & (idx.unsqueeze(0) < eot_pos.unsqueeze(1))
+        idx = torch.arange(caption_ids.size(1), device=caption_ids.device).unsqueeze(0)
+        return (idx >= self.text_offset) & (idx < eot_pos.unsqueeze(1))
 
     def encode_text(self, caption_ids):
         """Returns (t_global, t_local, word_tokens, word_mask)."""
-        x = self.base_model.encode_text(caption_ids)     # [B, L, D]
-        is_eot = caption_ids == self.eot_token
-        eot_pos = is_eot.float().argmax(dim=-1)
-        t_global = x[torch.arange(x.size(0), device=x.device), eot_pos]
+        if self.backbone == "siglip2":
+            t_global, x = self.base_model.encode_text(caption_ids)
+        else:
+            x = self.base_model.encode_text(caption_ids)     # [B, L, D]
+            is_eot = caption_ids == self.eot_token
+            eot_pos = is_eot.float().argmax(dim=-1)
+            t_global = x[torch.arange(x.size(0), device=x.device), eot_pos]
 
         mask = self.text_word_mask(caption_ids)
         t_local, word_tokens = self.la_text(x, mask)
@@ -147,6 +166,6 @@ class ViLNM(nn.Module):
 def build_model(args, num_classes: int = 11003) -> ViLNM:
     model = ViLNM(args, num_classes)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info("Built ViLNM: embed_dim=%d, num_classes=%d, trainable params=%.1fM",
-                model.embed_dim, num_classes, n_params / 1e6)
+    logger.info("Built ViLNM (%s): embed_dim=%d, num_classes=%d, trainable params=%.1fM",
+                model.backbone, model.embed_dim, num_classes, n_params / 1e6)
     return model

@@ -10,6 +10,12 @@ python train.py --dataset_name CUHK-PEDES --num_epoch 30 --batch_size 16 \
     --amp True --num_workers 6 --stop_after_epochs 4 --mlflow True
 python train.py ... --resume logs/CUHK-PEDES/vilnm/last.pth
 
+# VN3K with 20% of the training captions swapped to another identity
+python train.py --dataset_name VN3K --noise_file noise_sentence/VN3K-VI_0.2.npy
+
+# VN3K (Vietnamese captions) on the multilingual SigLIP 2 backbone
+python train.py --dataset_name VN3K --backbone siglip2 --batch_size 32 --amp True
+
 # CPU smoke test on the synthetic benchmark
 python tools/make_synthetic_data.py
 python train.py --dataset_name SYNTH-PEDES --name smoke --num_epoch 2 \
@@ -86,9 +92,11 @@ def main():
 
 
 # Changing any of these between sessions silently changes the training run.
-TRAJECTORY_ARGS = ("num_epoch", "batch_size", "lr", "lrscheduler", "warmup_epochs",
-                   "seed", "sampler", "img_size", "use_nta", "use_jii", "use_ndf",
-                   "use_id", "loss_on_global", "loss_on_local", "nta_rate", "amp")
+TRAJECTORY_ARGS = ("dataset_name", "noise_file", "backbone", "hf_model", "text_length",
+                   "freeze_token_embedding", "num_epoch", "batch_size", "lr",
+                   "lrscheduler", "warmup_epochs", "seed", "sampler", "img_size",
+                   "use_nta", "use_jii", "use_ndf", "use_id", "loss_on_global",
+                   "loss_on_local", "nta_rate", "nta_random", "amp")
 
 
 def check_resume_args(args, logger):

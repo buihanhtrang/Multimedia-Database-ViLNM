@@ -24,16 +24,23 @@ def read_image(path: str) -> Image.Image:
                 "IOError while reading %s, retrying", path)
 
 
+def n_specials(sot) -> int:
+    """Positions taken by special tokens: [SOS] + [EOS] for CLIP, [EOS] for SigLIP."""
+    return 1 if sot is None else 2
+
+
 def encode_caption(caption: str, tokenizer: SimpleTokenizer,
                    text_length: int = 77) -> List[int]:
-    """BPE-encode a caption to word ids, truncated to fit [SOS] ... [EOS]."""
-    return tokenizer.encode(caption)[:text_length - 2]
+    """Encode a caption to word ids, truncated to fit [SOS] ... [EOS]."""
+    return tokenizer.encode(caption)[:text_length - n_specials(tokenizer.sot_token)]
 
 
-def pad_tokens(word_ids: Sequence[int], sot: int, eot: int,
+def pad_tokens(word_ids: Sequence[int], sot, eot: int,
                text_length: int = 77) -> torch.Tensor:
-    """Wrap word ids with [SOS]/[EOS] and zero-pad to `text_length`."""
-    tokens = [sot] + list(word_ids)[:text_length - 2] + [eot]
+    """Wrap word ids with [SOS] (unless `sot` is None) and [EOS], zero-pad to
+    `text_length`.  Both CLIP's padding and SigLIP's <pad> are id 0."""
+    head = [] if sot is None else [sot]
+    tokens = head + list(word_ids)[:text_length - n_specials(sot)] + [eot]
     out = torch.zeros(text_length, dtype=torch.long)
     out[:len(tokens)] = torch.tensor(tokens, dtype=torch.long)
     return out
@@ -82,7 +89,7 @@ class ImageTextDataset(Dataset):
     def __init__(self, dataset, transform=None, text_length: int = 77,
                  tokenizer: SimpleTokenizer = None, use_nta: bool = True,
                  nta_rate: float = 0.2, nta_p1: float = 0.6, nta_p2: float = 0.8,
-                 seed: int = 1):
+                 seed: int = 1, nta_random: bool = False):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
@@ -95,9 +102,13 @@ class ImageTextDataset(Dataset):
         self.word_ids = [encode_caption(d[3], self.tokenizer, text_length)
                          for d in dataset]
 
+        replace_vocab = self.tokenizer.n_regular_tokens
+        if getattr(self.tokenizer, "replace_from_corpus", False):
+            replace_vocab = sorted({t for c in self.word_ids for t in c})
         self.nta_state = NTAState(
-            self.word_ids, self.tokenizer.mask_token,
-            self.tokenizer.n_regular_tokens, nta_rate, nta_p1, nta_p2, seed)
+            self.word_ids, self.tokenizer.mask_token, replace_vocab,
+            nta_rate, nta_p1, nta_p2, seed,
+            offset=n_specials(self.tokenizer.sot_token) - 1, random_scores=nta_random)
 
     def __len__(self):
         return len(self.dataset)

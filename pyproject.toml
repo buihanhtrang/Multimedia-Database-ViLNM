@@ -15,6 +15,8 @@ dependencies = [
     "mlflow>=2.14",
     "psutil>=7.2.2",
     "nvidia-ml-py>=13.615.71",
+    # --backbone siglip2 (SigLIP 2 towers + Gemma tokenizer)
+    "transformers>=5.20.2",
 ]
 
 [tool.uv]
@@ -31,3 +33,10 @@ torchvision = { index = "pytorch-cu130" }
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[dependency-groups]
+encoders = [
+    "open-clip-torch>=3.3.0",
+    "protobuf>=6.33.6",
+    "sentencepiece>=0.2.2",
+]

@@ -15,6 +15,7 @@ cd "$(dirname "$0")/.."
 
 NAME=${NAME:-vilnm_bs8_e30}
 DATASET=${DATASET:-CUHK-PEDES}
+BACKBONE=${BACKBONE:-clip}   # siglip2 for VN3K
 NUM_EPOCH=${NUM_EPOCH:-30}
 BATCH=${BATCH:-8}
 WORKERS=${WORKERS:-8}
@@ -26,6 +27,8 @@ PYTHON=${PYTHON:-.venv/bin/python}
 # conda's activate hook points LD_LIBRARY_PATH at its own CUDA libraries, which
 # breaks the venv's cuDNN (CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED).
 unset LD_LIBRARY_PATH
+# Less memory fragmentation; the card is shared with the desktop.
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
 LAST="logs/${DATASET}/${NAME}/last.pth"
 RESUME=()
@@ -43,7 +46,7 @@ if command -v systemd-inhibit >/dev/null; then
 fi
 
 exec "${INHIBIT[@]}" "$PYTHON" train.py \
-    --dataset_name "$DATASET" --name "$NAME" \
+    --dataset_name "$DATASET" --name "$NAME" --backbone "$BACKBONE" \
     --num_epoch "$NUM_EPOCH" --batch_size "$BATCH" --amp True \
     --num_workers "$WORKERS" --eval_period "$EVAL_PERIOD" \
     --stop_after_epochs "$EPOCHS" --max_hours "$HOURS" \

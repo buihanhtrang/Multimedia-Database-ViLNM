@@ -13,6 +13,8 @@ from PIL import Image
 
 MEAN = (0.48145466, 0.4578275, 0.40821073)
 STD = (0.26862954, 0.26130258, 0.27577711)
+# Per-backbone (mean, std): SigLIP 2 maps pixels to [-1, 1].
+NORMALIZATION = {"clip": (MEAN, STD), "siglip2": ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))}
 
 
 class RandomErasing(object):
@@ -50,13 +52,14 @@ class RandomErasing(object):
         return img
 
 
-def build_transforms(img_size=(384, 128), is_train=True, aug=True):
+def build_transforms(img_size=(384, 128), is_train=True, aug=True, backbone="clip"):
     height, width = img_size
+    mean, std = NORMALIZATION[backbone]
     if not is_train:
         return T.Compose([
             T.Resize((height, width), interpolation=Image.BICUBIC),
             T.ToTensor(),
-            T.Normalize(MEAN, STD),
+            T.Normalize(mean, std),
         ])
 
     if not aug:
@@ -64,7 +67,7 @@ def build_transforms(img_size=(384, 128), is_train=True, aug=True):
             T.Resize((height, width), interpolation=Image.BICUBIC),
             T.RandomHorizontalFlip(0.5),
             T.ToTensor(),
-            T.Normalize(MEAN, STD),
+            T.Normalize(mean, std),
         ])
 
     return T.Compose([
@@ -76,6 +79,6 @@ def build_transforms(img_size=(384, 128), is_train=True, aug=True):
         T.Pad(10),
         T.RandomCrop((height, width)),
         T.ToTensor(),
-        T.Normalize(MEAN, STD),
-        RandomErasing(probability=0.5, mean=MEAN),
+        T.Normalize(mean, std),
+        RandomErasing(probability=0.5, mean=mean),
     ])

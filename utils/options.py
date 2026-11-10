@@ -44,15 +44,21 @@ def get_args(argv=None):
 
     # ---------------- data ----------------
     p.add_argument("--dataset_name", default="CUHK-PEDES",
-                   choices=["CUHK-PEDES", "ICFG-PEDES", "RSTPReid", "SYNTH-PEDES"])
+                   choices=["CUHK-PEDES", "ICFG-PEDES", "RSTPReid", "VN3K", "SYNTH-PEDES"])
     p.add_argument("--root_dir", default="data")
+    p.add_argument("--noise_file", default="",
+                   help="noisy training captions: a .npy caption-swap index or a .json "
+                        "of per-caption replacements; relative paths are looked up "
+                        "under <root_dir>/<dataset>/ (see datasets/noise.py)")
     p.add_argument("--val_dataset", default="test", choices=["test", "val"])
     p.add_argument("--img_size", type=int, nargs=2, default=(384, 128),
                    metavar=("H", "W"))
     p.add_argument("--stride_size", type=int, default=16)
-    p.add_argument("--text_length", type=int, default=77)
+    p.add_argument("--text_length", type=int, default=0,
+                   help="caption length incl. special tokens "
+                        "(0 = backbone default: 77 for clip, 64 for siglip2)")
     p.add_argument("--vocab_size", type=int, default=49409,
-                   help="49408 CLIP tokens + 1 <|mask|> token for NTA")
+                   help="clip: 49408 CLIP tokens + 1 <|mask|> token for NTA")
     p.add_argument("--img_aug", type=str2bool, default=True)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--sampler", default="random", choices=["random", "identity"])
@@ -61,8 +67,19 @@ def get_args(argv=None):
     p.add_argument("--test_batch_size", type=int, default=128)
 
     # ---------------- model ----------------
+    p.add_argument("--backbone", default="clip", choices=["clip", "siglip2"],
+                   help="clip: OpenAI CLIP-ViT-B/16 (English, the paper's setup); "
+                        "siglip2: multilingual SigLIP 2 for VN3K (model/siglip_model.py)")
     p.add_argument("--pretrain_choice", default="pretrained/ViT-B-16.pt",
-                   help="path to the OpenAI CLIP checkpoint")
+                   help="clip: path to the OpenAI CLIP checkpoint")
+    p.add_argument("--hf_model", default="google/siglip2-base-patch16-256",
+                   help="siglip2: Hugging Face model id, cached under pretrained/hf")
+    p.add_argument("--freeze_token_embedding", type=str2bool, default=True,
+                   help="siglip2: keep the 256k-row token table (197M params) frozen")
+    p.add_argument("--grad_ckpt", type=str2bool, default=True,
+                   help="siglip2: gradient checkpointing; recomputes activations in "
+                        "the backward pass.  Needed on 6 GB: without it even batch 8 "
+                        "runs out of memory, with it batch 32-48 fits")
     p.add_argument("--no_pretrained", type=str2bool, default=False,
                    help="skip loading CLIP weights (random init; smoke tests only)")
     p.add_argument("--tiny_model", type=str2bool, default=False,
@@ -85,6 +102,10 @@ def get_args(argv=None):
 
     # ---------------- loss switches (for the ablation in Table II) ----------------
     p.add_argument("--use_nta", type=str2bool, default=True)
+    p.add_argument("--nta_random", type=str2bool, default=False,
+                   help="ablation control: eliminate tokens with the uniform "
+                        "probability nta_rate instead of the model's r' (same "
+                        "amount of masking/replacing/deleting, no image guidance)")
     p.add_argument("--use_jii", type=str2bool, default=True)
     p.add_argument("--use_ndf", type=str2bool, default=True)
     p.add_argument("--use_id", type=str2bool, default=True)
@@ -119,6 +140,14 @@ def get_args(argv=None):
                         "used by the smoke tests")
     p.add_argument("--save_last", type=str2bool, default=True,
                    help="write last.pth after every epoch")
+    p.add_argument("--save_snapshots", type=str2bool, default=False,
+                   help="keep a history for later analysis in <output_dir>/snapshots/: "
+                        "model weights at every evaluation (epoch_XX.pth, ~1.1 GB "
+                        "for SigLIP 2) and the NTA state after every epoch "
+                        "(nta_epoch_XX.pt, a few MB)")
+    p.add_argument("--snapshot_weights", default="all", choices=["all", "final"],
+                   help="with --save_snapshots: weights at every evaluation, or only "
+                        "at the last epoch (the NTA state is kept every epoch either way)")
     p.add_argument("--save_optimizer", type=str2bool, default=True,
                    help="include optimizer/scheduler/scaler/NTA/RNG state in last.pth "
                         "so training resumes exactly; triples the file size")
@@ -148,7 +177,12 @@ def get_args(argv=None):
     args = p.parse_args(argv)
     args.img_size = tuple(args.img_size)
     args.output_dir = op.join(args.output_dir, args.dataset_name, args.name)
-    args.eot_token = 49407          # CLIP's <|endoftext|>
+    if args.backbone == "siglip2":
+        args.text_length = args.text_length or 64
+        args.eot_token = 1          # Gemma <eos>
+    else:
+        args.text_length = args.text_length or 77
+        args.eot_token = 49407      # CLIP's <|endoftext|>
     if args.tiny_model:
         args.no_pretrained = True
     return args

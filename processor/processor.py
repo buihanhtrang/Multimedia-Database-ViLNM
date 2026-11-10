@@ -13,6 +13,12 @@ epoch -- so a run stopped and resumed any number of times follows the same
 trajectory as one run straight through (bit-exact on CPU with
 `--num_workers 0`; with workers, a resume *mid-epoch* re-seeds the augmentation
 RNG of the remaining batches, which changes nothing statistically).
+
+Besides the checkpoints, every run directory gets two small analysis files:
+`history.json` (per-epoch training averages and every evaluation, keyed by
+epoch so a resumed session overwrites rather than duplicates) and, when NTA is
+on, `nta_final.pt` (the final per-token noise levels r', used by
+`tools/ablation_report.py` to check whether NTA singles out the noisy words).
 """
 
 import json
@@ -99,6 +105,19 @@ def _write_status(args, **status):
     os.replace(tmp, op.join(args.output_dir, "status.json"))
 
 
+def _record_history(args, kind: str, epoch: int, values: dict):
+    """Store `values` under history.json[kind][epoch]; kind is "train" or "eval"."""
+    path = op.join(args.output_dir, "history.json")
+    history = {"train": {}, "eval": {}}
+    if op.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            history = json.load(f)
+    history[kind][str(epoch)] = values
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=1)
+    os.replace(path + ".tmp", path)
+
+
 def do_train(args, model, train_loader, evaluator: Evaluator, optimizer,
              scheduler, device, resume: dict = None, tracker=None):
     """Train until `--num_epoch` or until a stop trigger fires.
@@ -147,7 +166,20 @@ def do_train(args, model, train_loader, evaluator: Evaluator, optimizer,
 
     def evaluate(epoch):
         nonlocal best
+        # The last step's gradients (~0.7 GB for SigLIP 2) are dead weight here and
+        # are cleared by the next step's zero_grad anyway; free them so evaluation
+        # fits next to the optimizer state on a 6 GB card.
+        optimizer.zero_grad(set_to_none=True)
+        if device == "cuda":
+            torch.cuda.empty_cache()
         results = evaluator.eval(model)
+        _record_history(args, "eval", epoch, results)
+        if getattr(args, "save_snapshots", False) and (
+                getattr(args, "snapshot_weights", "all") == "all"
+                or epoch == args.num_epoch):
+            save_checkpoint({"epoch": epoch, "model": model.state_dict(),
+                             "results": results},
+                            op.join(args.output_dir, "snapshots", f"epoch_{epoch:02d}.pth"))
         tracker.log_metrics(results, step=epoch, prefix="eval")
         r1 = results["t2i"]["R1"]
         if r1 > best["R1"]:
@@ -277,6 +309,13 @@ def do_train(args, model, train_loader, evaluator: Evaluator, optimizer,
             nta_state.resample()
             nta_stats = nta_state.stats()
             logger.info("NTA epoch %d: %s", epoch, nta_stats)
+            if getattr(args, "save_snapshots", False):
+                # r' measured during this epoch and the captions it produced for
+                # the next one.
+                os.makedirs(op.join(args.output_dir, "snapshots"), exist_ok=True)
+                torch.save({"original": nta_state.original, "noise": nta_state.noise,
+                            "current": nta_state.current, "stats": nta_stats},
+                           op.join(args.output_dir, "snapshots", f"nta_epoch_{epoch:02d}.pt"))
 
         epoch_time = time.time() - epoch_start
         logger.info("epoch %d done in %.1fs | %s", epoch, epoch_time, meters)
@@ -287,6 +326,7 @@ def do_train(args, model, train_loader, evaluator: Evaluator, optimizer,
         if nta_stats:
             epoch_metrics.update({f"nta_{k}": v for k, v in nta_stats.items()})
         tracker.log_metrics(epoch_metrics, step=epoch, prefix="epoch")
+        _record_history(args, "train", epoch, epoch_metrics)
 
         do_eval = bool(args.eval_period) and (epoch % args.eval_period == 0
                                               or epoch == args.num_epoch)
@@ -316,6 +356,9 @@ def do_train(args, model, train_loader, evaluator: Evaluator, optimizer,
                 return pause(epoch, steps_per_epoch, True, reason)
 
     logger.info("training finished. best: %s", best)
+    if nta_state is not None and args.use_nta:
+        torch.save({"original": nta_state.original, "noise": nta_state.noise},
+                   op.join(args.output_dir, "nta_final.pt"))
     _write_status(args, state="finished", epoch=args.num_epoch, num_epoch=args.num_epoch,
                   global_step=global_step, best=best)
     tracker.set_tags({"state": "finished"})

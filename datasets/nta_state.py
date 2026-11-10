@@ -34,7 +34,9 @@ class NTAState:
                  rate: float = 0.2,
                  p1: float = 0.6,
                  p2: float = 0.8,
-                 seed: int = 1):
+                 seed: int = 1,
+                 offset: int = 1,
+                 random_scores: bool = False):
         self.original: List[List[int]] = [list(c) for c in captions]
         self.noise: List[np.ndarray] = [
             np.full(len(c), rate, dtype=np.float32) for c in self.original]
@@ -43,6 +45,12 @@ class NTAState:
 
         self.mask_token = mask_token
         self.vocab_limit = vocab_limit
+        self.offset = offset            # padded position of word 0: 1 after [SOS]
+        # Ablation control (--nta_random): every token is eliminated with
+        # probability `rate`, the mean of r' (Eq. 4), so the amount of masking /
+        # replacing / deleting matches NTA but ignores which words the image
+        # contradicts.  `noise` is still recorded, for the detection analysis.
+        self.random_scores = random_scores
         self.rate, self.p1, self.p2 = rate, p1, p2
         self.rng = random.Random(seed)
         self.last_counts = [0, 0, 0]
@@ -57,18 +65,21 @@ class NTAState:
         """Scatter one row of r' (indexed by *current* word position) onto `noise`.
 
         `noise_row` is the r' vector for the padded caption, so word position j
-        lives at `noise_row[j + 1]` ([SOS] occupies slot 0).
+        lives at `noise_row[j + offset]` (CLIP's [SOS] occupies slot 0; SigLIP
+        captions have no start token, offset 0).
         """
         src = self.src_index[index]
-        n = min(len(src), max(len(noise_row) - 1, 0))
+        n = min(len(src), max(len(noise_row) - self.offset, 0))
         target = self.noise[index]
         for j in range(n):
-            target[src[j]] = noise_row[j + 1]
+            target[src[j]] = noise_row[j + self.offset]
 
     def resample(self):
         """Rebuild every training caption with Eq. (5).  Called between epochs."""
         counts = [0, 0, 0]
         for i, (tokens, noise) in enumerate(zip(self.original, self.noise)):
+            if self.random_scores:
+                noise = np.full(len(tokens), self.rate, dtype=np.float32)
             new_tokens, src, c = eliminate_tokens(
                 tokens, noise, self.mask_token, self.vocab_limit,
                 self.p1, self.p2, self.rng)
